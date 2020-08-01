@@ -1,0 +1,223 @@
+Description: >
+    Mina George / Udagram
+
+Parameters:
+
+    EnvironmentName:
+        Description: An environment name that will be prefixed to resource names
+        Type: String
+        
+Resources:
+  
+  ## Security Groups
+  LBSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow http to our load balancer
+      VpcId:
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-VPCID"
+     
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+        CidrIp: 0.0.0.0/0
+     
+  WebServerSecGroup:
+
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow http to our hosts and SSH from local only
+      VpcId:
+        Fn::ImportValue:
+          !Sub "${EnvironmentName}-VPCID"
+      
+      SecurityGroupIngress:
+
+      - SourceSecurityGroupId: !Ref LBSecGroup
+        IpProtocol: tcp
+        FromPort: 80
+        ToPort: 80
+
+      - SourceSecurityGroupId: !Ref JumpBoxSecGroup
+        IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+
+  JumpBoxSecGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for JumpBox server
+      VpcId:
+        Fn::ImportValue: 
+          !Sub "${EnvironmentName}-VPCID"
+      SecurityGroupIngress:
+      - CidrIp: 0.0.0.0/0
+        IpProtocol: tcp
+        FromPort: 22
+        ToPort: 22
+      Tags:
+        - Key: Name
+          Value: !Sub "${EnvironmentName} JumpBox Security Group"
+
+  ## Servers Configs      
+  WebAppLaunchConfig:
+    Type: AWS::AutoScaling::LaunchConfiguration
+    Properties:
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          sudo apt update -y
+          sudo apt install unzip awscli -y
+          apt-get install apache2 -y
+          cd /var/www/html
+          aws s3 cp s3://udgram/udacity.zip .
+          unzip -o udacity.zip
+      ImageId: ami-005bdb005fb00e791
+      KeyName: private-server-key
+      IamInstanceProfile: !Ref WebAppProfileRoles
+      SecurityGroups:
+      - Ref: WebServerSecGroup
+      InstanceType: t3.medium
+      BlockDeviceMappings:
+      - DeviceName: "/dev/sdk"
+        Ebs:
+          VolumeSize: '10'  
+
+  WebAppTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      HealthCheckIntervalSeconds: 10
+      HealthCheckPath: /
+      HealthCheckProtocol: HTTP
+      HealthCheckTimeoutSeconds: 8
+      HealthyThresholdCount: 2
+      Port: 80
+      Protocol: HTTP
+      UnhealthyThresholdCount: 5
+      VpcId: 
+        Fn::ImportValue:
+          Fn::Sub: "${EnvironmentName}-VPCID"  
+          
+  WebAppGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      VPCZoneIdentifier:
+      - Fn::ImportValue: 
+          !Sub "${EnvironmentName}-PRIV-NETS"
+      LaunchConfigurationName:
+        Ref: WebAppLaunchConfig
+      DesiredCapacity: 4
+      MinSize: '2'
+      MaxSize: '4'
+      MetricsCollection:
+        - Granularity: "1Minute"
+          Metrics:
+            - "GroupMinSize"
+            - "GroupMaxSize"
+      TargetGroupARNs:
+      - Ref: WebAppTargetGroup
+          
+  WebAppLB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Subnets:
+      - Fn::ImportValue: !Sub "${EnvironmentName}-PUB1-SN"
+      - Fn::ImportValue: !Sub "${EnvironmentName}-PUB2-SN"
+      SecurityGroups:
+      - Ref: LBSecGroup
+ 
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+      - Type: forward
+        TargetGroupArn:
+          Ref: WebAppTargetGroup
+      LoadBalancerArn:
+        Ref: WebAppLB
+      Port: '80'
+      Protocol: 'HTTP'
+
+  ALBListenerRule:
+      Type: AWS::ElasticLoadBalancingV2::ListenerRule
+      Properties:
+        Actions:
+        - Type: forward
+          TargetGroupArn: !Ref 'WebAppTargetGroup'
+        Conditions:
+        - Field: path-pattern
+          Values: [/]
+        ListenerArn: !Ref 'Listener'
+        Priority: 1
+        
+  JumpBox1:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: ami-06f2f779464715dc5
+      InstanceType: t2.micro
+      KeyName: jumpbox-key
+      SubnetId:
+        Fn::ImportValue: 
+          Fn::Sub: "${EnvironmentName}-PUB1-SN"
+      AvailabilityZone: !Select [ 0, !GetAZs '' ]
+      SecurityGroupIds:
+        - Ref: JumpBoxSecGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} JumpBox 1
+       
+  JumpBox2:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: ami-06f2f779464715dc5
+      InstanceType: t2.micro
+      KeyName: jumpbox-key
+      SubnetId:
+        Fn::ImportValue: 
+          Fn::Sub: "${EnvironmentName}-PUB2-SN"
+      AvailabilityZone: !Select [ 1, !GetAZs '' ]
+      SecurityGroupIds:
+        - Ref: JumpBoxSecGroup
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName} JumpBox 2          
+
+  ## IAM Rouls        
+  S3IamRole:
+    Type: AWS::IAM::Role
+    Properties:
+        RoleName: 
+            !Sub ${EnvironmentName}-Role
+        AssumeRolePolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+            -   Effect: Allow
+                Principal:
+                    Service:
+                    - ec2.amazonaws.com
+                Action:
+                - sts:AssumeRole
+        Path: "/"
+
+  S3IamPolicy:
+      Type: AWS::IAM::Policy
+      Properties:
+          PolicyName: AmazonS3ReadOnlyAccess
+          PolicyDocument:
+              Statement:
+              - Effect: Allow
+                Action: 
+                -   s3:Get*
+                -   s3:List*
+                Resource: "*"
+          Roles:
+          - Ref: S3IamRole  
+
+  WebAppProfileRoles:
+      Type: AWS::IAM::InstanceProfile
+      Properties:
+          Path: "/"
+          Roles:
+          - Ref: S3IamRole
